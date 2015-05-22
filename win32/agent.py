@@ -5,7 +5,6 @@ import multiprocessing
 from optparse import Values
 import servicemanager
 import sys
-import threading
 import time
 import tornado.httpclient
 from win32.common import handle_exe_click
@@ -70,12 +69,14 @@ class AgentSvc(win32serviceutil.ServiceFramework):
 
         # Keep a list of running processes so we can start/end as needed.
         # Processes will start started in order and stopped in reverse order.
+        jmxfetch = JMXFetchProcess(config, self.hostname)
+
         self.procs = {
             'forwarder': ProcessWatchDog("forwarder", DDForwarder(config, self.hostname)),
             'collector': ProcessWatchDog("collector", DDAgent(agentConfig, self.hostname,
                                          heartbeat=self._collector_send_heartbeat)),
             'dogstatsd': ProcessWatchDog("dogstatsd", DogstatsdProcess(config, self.hostname)),
-            'jmxfetch': ProcessWatchDog("jmxfetch", JMXFetchProcess(config, self.hostname), 3),
+            'jmxfetch': ProcessWatchDog("jmxfetch", jmxfetch, cleanup=jmxfetch.stop, max_restarts=3)
         }
 
     def SvcStop(self):
@@ -129,18 +130,64 @@ class AgentSvc(win32serviceutil.ServiceFramework):
 class ProcessWatchDog(object):
     """
     Monitor the attached process.
-    Restarts when it exits until the limit set is reached.
+
+    Features:
+    * Automatic restart: restarts the process when it exits.
+        Stop when the `max_restarts` limit is reached.
+    * Cleanup method: set a `cleanup` method to execute to exit the process.
+        If set, a thread is attached to the process
     """
-    def __init__(self, name, process, max_restarts=5):
+    def __init__(self, name, process, cleanup=None, max_restarts=5):
         self._name = name
         self._process = process
-        self._count_restarts = 0
+        self._cleanup = cleanup
         self._MAX_RESTARTS = max_restarts
+
+        self._count_restarts = 0
+        self._guillotine = None
+
+    def _set_cleanup(self):
+        """
+        Modify process `run` method to spawn a `cooperative` cleanup thread. Create a trigger, which
+        will invoke `execute` method when squeezed.
+        """
+        self._guillotine = multiprocessing.Event()
+
+        def execute():
+            """
+            Thread 'execute' method. Wait for the trigger and run `cleanup`
+            """
+            self._guillotine.wait()
+            self._cleanup()
+            return
+
+        def run_with_executioner(f):
+            """
+            Wrapper around process `run method`.
+            Note: thread termination is guaranted by `_cleanup` termination.
+            """
+            def wrapped_f(*args):
+                import threading
+                executioner = threading.Thread(target=execute)
+                executioner.start()
+                f(*args)
+                self._guillotine.set()
+                executioner.join()
+
+            return wrapped_f
+
+        self._process.run = run_with_executioner(self._process.run)
 
     def start(self):
         return self._process.start()
 
-    def terminate(self):
+    def stop(self):
+        """
+        Squeeze the trigger or terminate process.
+        """
+        if self._cleanup:
+            self._guillotine.set()
+            return self._process.join()
         return self._process.terminate()
 
     def is_alive(self):
@@ -286,7 +333,7 @@ class JMXFetchProcess(multiprocessing.Process):
             self.jmx_daemon.run()
 
     def stop(self):
-        pass
+        self.jmx_daemon.terminate()
 
 
 if __name__ == '__main__':
