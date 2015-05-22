@@ -44,6 +44,13 @@ VALUE_AND_BASE_QUERY = '''select cntr_value
                           order by cntr_type;'''
 
 
+class SQLConnectionError(Exception):
+    """
+    Exception raised for SQL instance connection issues
+    """
+    pass
+
+
 class SQLServer(AgentCheck):
 
     SOURCE_TYPE_NAME = 'sql server'
@@ -69,48 +76,60 @@ class SQLServer(AgentCheck):
 
         # Cache connections
         self.connections = {}
-
         self.instances_metrics = {}
+
+        custom_metrics = init_config.get('custom_metrics', [])
+
         for instance in instances:
+            try:
+                self._make_metric_list_to_collect(instance, custom_metrics)
+            except SQLConnectionError:
+                self.log.exception("Skipping SQL Server instance")
+                continue
 
-            metrics_to_collect = []
-            for name, counter_name, instance_name in self.METRICS:
-                try:
-                    sql_type, base_name = self.get_sql_type(instance, counter_name)
-                    metrics_to_collect.append(self.typed_metric(name,
-                                                                counter_name,
-                                                                base_name,
-                                                                None,
-                                                                sql_type,
-                                                                instance_name,
-                                                                None))
-                except Exception:
-                    self.log.warning("Can't load the metric %s, ignoring", name, exc_info=True)
-                    continue
-
-            # Load any custom metrics from conf.d/sqlserver.yaml
-            for row in init_config.get('custom_metrics', []):
-                user_type = row.get('type')
-                if user_type is not None and user_type not in VALID_METRIC_TYPES:
-                    self.log.error('%s has an invalid metric type: %s' % (row['name'], user_type))
-                sql_type = None
-                try:
-                    if user_type is None:
-                        sql_type, base_name = self.get_sql_type(instance, row['counter_name'])
-                except Exception:
-                    self.log.warning("Can't load the metric %s, ignoring", name, exc_info=True)
-                    continue
-
-                metrics_to_collect.append(self.typed_metric(row['name'],
-                                                            row['counter_name'],
+    def _make_metric_list_to_collect(self, instance, custom_metrics):
+        """
+        Store the list of metrics to collect by instance_key.
+        Will also create and cache cursors to query the db.
+        """
+        metrics_to_collect = []
+        for name, counter_name, instance_name in self.METRICS:
+            try:
+                sql_type, base_name = self.get_sql_type(instance, counter_name)
+                metrics_to_collect.append(self.typed_metric(name,
+                                                            counter_name,
                                                             base_name,
-                                                            user_type,
+                                                            None,
                                                             sql_type,
-                                                            row.get('instance_name', ''),
-                                                            row.get('tag_by', None)))
+                                                            instance_name,
+                                                            None))
+            except Exception:
+                self.log.warning("Can't load the metric %s, ignoring", name, exc_info=True)
+                continue
 
-            instance_key = self._conn_key(instance)
-            self.instances_metrics[instance_key] = metrics_to_collect
+        # Load any custom metrics from conf.d/sqlserver.yaml
+        for row in custom_metrics:
+            user_type = row.get('type')
+            if user_type is not None and user_type not in VALID_METRIC_TYPES:
+                self.log.error('%s has an invalid metric type: %s' % (row['name'], user_type))
+            sql_type = None
+            try:
+                if user_type is None:
+                    sql_type, base_name = self.get_sql_type(instance, row['counter_name'])
+            except Exception:
+                self.log.warning("Can't load the metric %s, ignoring", name, exc_info=True)
+                continue
+
+            metrics_to_collect.append(self.typed_metric(row['name'],
+                                                        row['counter_name'],
+                                                        base_name,
+                                                        user_type,
+                                                        sql_type,
+                                                        row.get('instance_name', ''),
+                                                        row.get('tag_by', None)))
+
+        instance_key = self._conn_key(instance)
+        self.instances_metrics[instance_key] = metrics_to_collect
 
     def typed_metric(self, dd_name, sql_name, base_name, user_type, sql_type, instance_name, tag_by):
         '''
@@ -194,14 +213,14 @@ class SQLServer(AgentCheck):
                 cx = "%s - %s" % (host, database)
                 message = "Unable to connect to SQL Server for instance %s." % cx
                 self.service_check(self.SERVICE_CHECK_NAME, AgentCheck.CRITICAL,
-                    tags=service_check_tags, message=message)
+                                   tags=service_check_tags, message=message)
 
                 password = instance.get('password')
                 tracebk = traceback.format_exc()
                 if password is not None:
                     tracebk = tracebk.replace(password, "*" * 6)
 
-                raise Exception("%s \n %s" % (message, tracebk))
+                raise SQLConnectionError("%s \n %s" % (message, tracebk))
 
         conn = self.connections[conn_key]
         cursor = conn.cursor()
