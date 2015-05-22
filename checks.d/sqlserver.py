@@ -76,6 +76,7 @@ class SQLServer(AgentCheck):
 
         # Cache connections
         self.connections = {}
+        self.failed_connections = set()
         self.instances_metrics = {}
 
         custom_metrics = init_config.get('custom_metrics', [])
@@ -103,6 +104,8 @@ class SQLServer(AgentCheck):
                                                             sql_type,
                                                             instance_name,
                                                             None))
+            except SQLConnectionError:
+                raise
             except Exception:
                 self.log.warning("Can't load the metric %s, ignoring", name, exc_info=True)
                 continue
@@ -200,6 +203,9 @@ class SQLServer(AgentCheck):
             'db:%s' % database
         ]
 
+        if conn_key in self.failed_connections:
+            raise SQLConnectionError
+
         if conn_key not in self.connections:
             try:
                 conn = adodbapi.connect(
@@ -210,6 +216,7 @@ class SQLServer(AgentCheck):
                 self.connections[conn_key] = conn
                 self.service_check(self.SERVICE_CHECK_NAME, AgentCheck.OK, tags=service_check_tags)
             except Exception:
+                self.failed_connections.add(conn_key)
                 cx = "%s - %s" % (host, database)
                 message = "Unable to connect to SQL Server for instance %s." % cx
                 self.service_check(self.SERVICE_CHECK_NAME, AgentCheck.CRITICAL,
@@ -263,10 +270,15 @@ class SQLServer(AgentCheck):
     def check(self, instance):
         ''' Fetch the metrics from the sys.dm_os_performance_counters table
         '''
-        cursor = self.get_cursor(instance)
+        try:
+            cursor = self.get_cursor(instance)
+        except SQLConnectionError:
+            return
+
         custom_tags = instance.get('tags', [])
         instance_key = self._conn_key(instance)
         metrics_to_collect = self.instances_metrics[instance_key]
+
         for metric in metrics_to_collect:
             try:
                 metric.fetch_metric(cursor, custom_tags)
